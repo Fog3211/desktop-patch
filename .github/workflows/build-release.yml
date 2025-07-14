@@ -1,0 +1,185 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      feature_branch:
+        description: '要合并的功能分支名称'
+        required: true
+        default: 'feature/my-changes'
+        type: string
+      release_version:
+        description: '发布版本号 (如 v1.0.0-custom.1)'
+        required: true
+        default: 'v1.0.0-custom.1'
+        type: string
+
+jobs:
+  merge-and-build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            platform: darwin
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Create/Update release branch
+        run: |
+          echo "🔄 准备 release 分支..."
+          
+          # 获取最新的 development 分支
+          git fetch origin development
+          git checkout development
+          git pull origin development
+          
+          # 创建或切换到 release 分支
+          git checkout release || git checkout -b release development
+          
+          # 重置 release 分支到最新的 development
+          git reset --hard development
+          
+          echo "✅ release 分支已重置到最新的 development"
+
+      - name: Merge feature branch
+        run: |
+          echo "🔀 合并功能分支: ${{ github.event.inputs.feature_branch }}"
+          
+          # 获取功能分支
+          git fetch origin ${{ github.event.inputs.feature_branch }}
+          
+          # 合并功能分支
+          git merge origin/${{ github.event.inputs.feature_branch }} --no-edit
+          
+          echo "✅ 功能分支合并完成"
+          
+          # 显示合并后的状态
+          echo "📊 合并后的提交历史："
+          git log --oneline -10
+
+      - name: Update version in package.json
+        run: |
+          echo "📝 更新版本号到: ${{ github.event.inputs.release_version }}"
+          
+          # 使用 Node.js 更新版本号
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '${{ github.event.inputs.release_version }}';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+            console.log('Version updated to:', pkg.version);
+          "
+
+      - name: Install dependencies
+        run: |
+          echo "📦 安装依赖..."
+          npm ci
+
+      - name: Build application
+        env:
+          # 个人使用，无需签名证书
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: |
+          echo "🏗️ 构建 ${{ matrix.platform }} 平台应用..."
+          
+          # 根据平台构建
+          if [ "${{ matrix.platform }}" = "darwin" ]; then
+            npm run build:mac
+          elif [ "${{ matrix.platform }}" = "win32" ]; then
+            npm run build:win
+          else
+            npm run build:linux
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-patch-${{ matrix.platform }}-${{ github.event.inputs.release_version }}
+          path: |
+            dist/*.dmg
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.zip
+            dist/*.tar.gz
+          retention-days: 30
+
+  create-release:
+    needs: merge-and-build
+    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.release_version }}
+          name: 'GitHub Desktop Custom ${{ github.event.inputs.release_version }}'
+          body: |
+            ## 🎉 GitHub Desktop 个人定制版
+
+            **基于**: GitHub Desktop 官方最新版
+            **功能分支**: `${{ github.event.inputs.feature_branch }}`
+            **构建时间**: ${{ github.run_number }}
+
+            ### 📥 下载
+
+            选择适合你操作系统的版本：
+            
+            - **macOS**: `.dmg` 文件
+            - **Windows**: `.exe` 文件  
+            - **Linux**: `.AppImage` 文件
+
+            ### 🔄 自动更新
+
+            应用内置自动更新功能，后续版本会自动推送更新通知。
+
+            ### ⚠️ 注意事项
+
+            - **macOS 用户**: 首次打开需要右键点击选择"打开"并确认
+            - **Windows 用户**: 可能会有 SmartScreen 警告，点击"更多信息"→"仍要运行"
+            - **个人使用**: 此版本仅供个人使用，未经官方签名
+
+            ---
+            *自动构建于 GitHub Actions*
+          files: release-assets/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Update release branch
+        run: |
+          echo "📤 推送 release 分支到远程..."
+          git checkout release
+          git push origin release --force-with-lease 

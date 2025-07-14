@@ -26,163 +26,72 @@ jobs:
           git remote add upstream https://github.com/desktop/desktop.git || true
           git fetch upstream
 
-      - name: Check current branch
+      - name: Switch to development branch
         run: |
           echo "Current branch: $(git branch --show-current)"
-          git checkout development || git checkout -b development origin/development || git checkout -b development
+          git checkout development || git checkout -b development
+
+      - name: Check for upstream updates
+        id: check
+        run: |
+          # 获取上游最新提交
+          UPSTREAM_HEAD=$(git rev-parse upstream/development)
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          
+          echo "upstream_head=$UPSTREAM_HEAD" >> $GITHUB_OUTPUT
+          echo "local_head=$LOCAL_HEAD" >> $GITHUB_OUTPUT
+          
+          if [ "$UPSTREAM_HEAD" = "$LOCAL_HEAD" ]; then
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "✅ develop 分支已是最新"
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            # 计算提交差异
+            COMMITS_BEHIND=$(git rev-list --count HEAD..upstream/development)
+            echo "commits_behind=$COMMITS_BEHIND" >> $GITHUB_OUTPUT
+            echo "🔄 发现 $COMMITS_BEHIND 个新提交需要同步"
+          fi
 
       - name: Sync with upstream
-        id: sync
+        if: steps.check.outputs.has_updates == 'true'
         run: |
-          echo "🔄 Fetching latest changes from upstream..."
-          git fetch upstream development
+          echo "🔄 正在同步上游更改..."
           
-          echo "📊 Checking for differences..."
-          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/development)
-          echo "commits_behind=$BEHIND_COUNT" >> $GITHUB_OUTPUT
+          # 强制更新到上游最新状态（保持 develop 分支纯净）
+          git reset --hard upstream/development
           
-          if [ "$BEHIND_COUNT" -eq 0 ]; then
-            echo "✅ Already up to date!"
-            echo "sync_needed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          echo "📦 Found $BEHIND_COUNT new commits from upstream"
-          echo "sync_needed=true" >> $GITHUB_OUTPUT
-          
-          # 尝试合并上游更改
-          echo "🔀 Attempting to merge upstream changes..."
-          if git merge upstream/development --no-edit; then
-            echo "✅ Merge successful!"
-            echo "merge_status=success" >> $GITHUB_OUTPUT
-            
-            # 推送更改
-            git push origin development
-            echo "🚀 Changes pushed to origin/development"
-            
-          else
-            echo "❌ Merge conflicts detected!"
-            echo "merge_status=conflict" >> $GITHUB_OUTPUT
-            
-            # 中止合并并重置
-            git merge --abort
-            git reset --hard HEAD
-            
-            # 获取冲突的文件列表（通过尝试合并再中止来获取）
-            git merge upstream/development --no-edit 2>&1 | grep "CONFLICT" > conflicts.txt || echo "Could not determine conflict files" > conflicts.txt
-            git merge --abort
-            
-            echo "📋 Conflict details:"
-            cat conflicts.txt
-          fi
+          echo "✅ 同步完成！"
+          echo "📊 最新提交："
+          git log --oneline -5
 
-      - name: Create conflict issue
-        if: steps.sync.outputs.merge_status == 'conflict'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let conflictDetails = '';
-            
-            try {
-              conflictDetails = fs.readFileSync('conflicts.txt', 'utf8');
-            } catch (error) {
-              conflictDetails = 'Could not read conflict details';
-            }
-            
-            const title = `🔄 Upstream sync conflict detected - ${new Date().toISOString().split('T')[0]}`;
-            const body = `
-            ## 🚨 自动同步上游仓库时发生冲突
-            
-            **时间**: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}
-            **上游仓库**: https://github.com/desktop/desktop
-            **目标分支**: development
-            
-            ### 冲突详情
-            \`\`\`
-            ${conflictDetails}
-            \`\`\`
-            
-            ### 解决步骤
-            1. 本地执行以下命令：
-               \`\`\`bash
-               git fetch upstream
-               git checkout development
-               git merge upstream/development
-               \`\`\`
-            
-            2. 手动解决冲突文件
-            
-            3. 提交解决后的代码：
-               \`\`\`bash
-               git add .
-               git commit -m "Resolve merge conflicts with upstream"
-               git push origin development
-               \`\`\`
-            
-            4. 关闭此 Issue
-            
-            ### 相关补丁
-            请检查以下补丁文件是否需要更新：
-            - \`patches/\` 目录下的所有 .patch 文件
-            
-            ---
-            _This issue was automatically created by the upstream sync workflow._
-            `;
-            
-            // 检查是否已存在相同的未关闭 issue
-            const { data: existingIssues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'upstream-sync,conflict'
-            });
-            
-            const todayStr = new Date().toISOString().split('T')[0];
-            const existingToday = existingIssues.find(issue => 
-              issue.title.includes(todayStr)
-            );
-            
-            if (!existingToday) {
-              const { data: issue } = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: title,
-                body: body,
-                labels: ['upstream-sync', 'conflict', 'help wanted']
-              });
-              
-              console.log(`Created issue: ${issue.html_url}`);
-            } else {
-              console.log(`Issue for today already exists: ${existingToday.html_url}`);
-            }
-
-      - name: Create success summary
-        if: steps.sync.outputs.sync_needed == 'true' && steps.sync.outputs.merge_status == 'success'
+      - name: Push changes
+        if: steps.check.outputs.has_updates == 'true'
         run: |
-          echo "## 🎉 Upstream Sync Successful" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Time**: $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "**Commits synced**: ${{ steps.sync.outputs.commits_behind }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Status**: ✅ No conflicts detected" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Latest commits from upstream:" >> $GITHUB_STEP_SUMMARY
-          git log --oneline -5 upstream/development >> $GITHUB_STEP_SUMMARY
+          echo "📤 推送更改到远程仓库..."
+          git push origin development --force-with-lease
+          echo "✅ 推送完成！"
 
-      - name: Create up-to-date summary
-        if: steps.sync.outputs.sync_needed == 'false'
-        run: |
-          echo "## ✅ Repository Already Up to Date" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Time**: $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "**Status**: No new commits from upstream" >> $GITHUB_STEP_SUMMARY
-
-      - name: Clean up
+      - name: Create sync summary
         if: always()
         run: |
-          # 清理临时文件
-          rm -f conflicts.txt
+          echo "## 🔄 上游同步摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          # 确保回到干净状态
-          git checkout development
-          git reset --hard HEAD 
+                     if [ "${{ steps.check.outputs.has_updates }}" = "true" ]; then
+             echo "### ✅ 同步成功" >> $GITHUB_STEP_SUMMARY
+             echo "- 📦 同步了 ${{ steps.check.outputs.commits_behind }} 个新提交" >> $GITHUB_STEP_SUMMARY
+             echo "- 🎯 development 分支已更新到最新状态" >> $GITHUB_STEP_SUMMARY
+             echo "- 🔗 可以开始将你的功能分支变基到最新的 development" >> $GITHUB_STEP_SUMMARY
+           else
+             echo "### ℹ️ 无需同步" >> $GITHUB_STEP_SUMMARY
+             echo "- ✅ development 分支已是最新状态" >> $GITHUB_STEP_SUMMARY
+             echo "- 📅 下次检查: 明天凌晨 2 点" >> $GITHUB_STEP_SUMMARY
+           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 下一步操作" >> $GITHUB_STEP_SUMMARY
+                     echo "如果你的功能分支需要更新，请运行：" >> $GITHUB_STEP_SUMMARY
+           echo '```bash' >> $GITHUB_STEP_SUMMARY
+           echo 'git checkout feature/your-feature' >> $GITHUB_STEP_SUMMARY
+           echo 'git rebase development' >> $GITHUB_STEP_SUMMARY
+           echo '```' >> $GITHUB_STEP_SUMMARY 
